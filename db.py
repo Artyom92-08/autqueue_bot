@@ -1,3 +1,4 @@
+# db.py
 from __future__ import annotations
 
 import secrets
@@ -66,13 +67,6 @@ class BookingRow:
 
     claim_token: str | None
 
-    # --- timers for called confirm (new) ---
-    called_at: int | None
-    eta_due_at: int | None
-    confirm_expires_at: int | None
-    confirm_tries: int
-    confirm_last_sent_at: int | None
-
     created_at: str
     updated_at: str
 
@@ -104,13 +98,6 @@ async def init_db() -> None:
             offer_cooldown_until INTEGER DEFAULT NULL,
 
             claim_token TEXT DEFAULT NULL,
-
-            -- new columns for "called" confirm logic
-            called_at INTEGER DEFAULT NULL,
-            eta_due_at INTEGER DEFAULT NULL,
-            confirm_expires_at INTEGER DEFAULT NULL,
-            confirm_tries INTEGER NOT NULL DEFAULT 0,
-            confirm_last_sent_at INTEGER DEFAULT NULL,
 
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -144,13 +131,6 @@ async def init_db() -> None:
 
         await add_col("claim_token", "ALTER TABLE bookings ADD COLUMN claim_token TEXT DEFAULT NULL")
 
-        # --- new columns for "called" confirm logic ---
-        await add_col("called_at", "ALTER TABLE bookings ADD COLUMN called_at INTEGER DEFAULT NULL")
-        await add_col("eta_due_at", "ALTER TABLE bookings ADD COLUMN eta_due_at INTEGER DEFAULT NULL")
-        await add_col("confirm_expires_at", "ALTER TABLE bookings ADD COLUMN confirm_expires_at INTEGER DEFAULT NULL")
-        await add_col("confirm_tries", "ALTER TABLE bookings ADD COLUMN confirm_tries INTEGER NOT NULL DEFAULT 0")
-        await add_col("confirm_last_sent_at", "ALTER TABLE bookings ADD COLUMN confirm_last_sent_at INTEGER DEFAULT NULL")
-
         await db.commit()
 
         # 3) индексы — только после миграций
@@ -170,11 +150,6 @@ async def init_db() -> None:
         await safe_index("CREATE INDEX IF NOT EXISTS idx_bookings_offer_expires ON bookings(offer_expires_at)")
         await safe_index("CREATE INDEX IF NOT EXISTS idx_bookings_claim_token ON bookings(claim_token)")
         await safe_index("CREATE INDEX IF NOT EXISTS idx_bookings_needs_admin_ok ON bookings(needs_admin_ok)")
-
-        # new indexes
-        await safe_index("CREATE INDEX IF NOT EXISTS idx_bookings_called_at ON bookings(called_at)")
-        await safe_index("CREATE INDEX IF NOT EXISTS idx_bookings_eta_due_at ON bookings(eta_due_at)")
-        await safe_index("CREATE INDEX IF NOT EXISTS idx_bookings_confirm_expires_at ON bookings(confirm_expires_at)")
 
         await db.commit()
 
@@ -270,7 +245,7 @@ async def next_seq_for_day(day: date) -> int:
     return int(seq)
 
 
-# -------------------- CRUD create/read/update --------------------
+# -------------------- CRUD create/read/update (минимум нужного на следующих шагах) --------------------
 async def add_static_booking(day: date, user_id: int, user_name: str, phone: str, car_text: str, issue_text: str) -> tuple[int, int]:
     day_s = day.isoformat()
     ts = now_iso()
@@ -368,9 +343,7 @@ async def get_booking(bid: int) -> Optional[BookingRow]:
                    status,
                    kind, eta_minutes, manual_call_only, needs_admin_ok,
                    offer_day, offer_stage, offer_expires_at, offer_cooldown_until,
-                   claim_token,
-                   called_at, eta_due_at, confirm_expires_at, confirm_tries, confirm_last_sent_at,
-                   created_at, updated_at
+                   claim_token, created_at, updated_at
             FROM bookings
             WHERE id=?
         """, (int(bid),))
@@ -397,9 +370,6 @@ async def cancel_booking(bid: int, user_id: int) -> bool:
             SET status='canceled',
                 offer_day=NULL, offer_stage=NULL, offer_expires_at=NULL,
                 needs_admin_ok=0,
-                eta_minutes=NULL,
-                called_at=NULL, eta_due_at=NULL,
-                confirm_expires_at=NULL, confirm_tries=0, confirm_last_sent_at=NULL,
                 updated_at=?
             WHERE id=? AND user_id=? AND status IN ({",".join(["?"] * len(CLIENT_ACTIVE_STATUSES))})
         """, (ts, int(bid), int(user_id), *CLIENT_ACTIVE_STATUSES))
@@ -480,22 +450,22 @@ async def add_booking_admin_manual(day: date, client_name: str, phone: str, car_
     return bid, int(seq), token
 
 
-async def claim_booking(token: str, user_id: int, user_name: str) -> tuple[bool, str, int | None]:
+async def claim_booking(token: str, user_id: int, user_name: str) -> tuple[bool, str]:
     ts = now_iso()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
 
         cur = await db.execute("""
-            SELECT id, day, seq, car_text, issue_text, status
+            SELECT id, day, seq, car_text, issue_text
             FROM bookings
             WHERE claim_token=? AND user_id=0
         """, (token,))
         row = await cur.fetchone()
         if not row:
             await db.commit()
-            return False, "⛔ Ссылка неактуальна или запись уже привязана.", None
+            return False, "⛔ Ссылка неактуальна или запись уже привязана."
 
-        bid, day_s, seq, car, issue, status = row
+        bid, day_s, seq, car, issue = row
 
         await db.execute("""
             UPDATE bookings
@@ -505,16 +475,14 @@ async def claim_booking(token: str, user_id: int, user_name: str) -> tuple[bool,
 
         await db.commit()
 
-    msg = (
+    return True, (
         "✅ <b>Запись привязана</b> к вашему Telegram.\n\n"
         f"📅 Дата: <b>{date.fromisoformat(day_s).strftime('%d.%m.%Y')}</b>\n"
         f"🔢 Номер: <b>№{int(seq)}</b>\n"
         f"🚗 Авто: {car}\n"
-        f"🛠 Задача: {issue}\n"
-        f"📌 Статус: <b>{status}</b>\n\n"
+        f"🛠 Задача: {issue}\n\n"
         "Дальше статусы будут приходить сюда."
     )
-    return True, msg, int(bid)
 
 
 # -------------------- OFFER TODAY HELPERS --------------------
@@ -588,12 +556,10 @@ async def clear_offer(bid: int, cooldown_until: Optional[int] = None) -> None:
             WHERE id=?
         """, (cooldown_until, ts, int(bid)))
         await db.commit()
-
-
 async def move_booking_to_day_append_seq(bid: int, new_day: date, new_kind: str = KIND_STATIC) -> Optional[int]:
     """
     Перенос записи на другую дату и постановка в конец очереди этой даты.
-    Сбрасывает ETA и ожидание решения мастера, а также таймеры "called".
+    Сбрасывает "время прибытия" и ожидание решения мастера.
     """
     ts = now_iso()
     new_day_s = new_day.isoformat()
@@ -614,11 +580,6 @@ async def move_booking_to_day_append_seq(bid: int, new_day: date, new_kind: str 
                 offer_day=NULL,
                 offer_stage=NULL,
                 offer_expires_at=NULL,
-                called_at=NULL,
-                eta_due_at=NULL,
-                confirm_expires_at=NULL,
-                confirm_tries=0,
-                confirm_last_sent_at=NULL,
                 updated_at=?
             WHERE id=? AND status IN ('waiting','called')
         """, (new_day_s, int(new_seq), new_kind, ts, int(bid)))
